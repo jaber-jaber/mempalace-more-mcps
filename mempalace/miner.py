@@ -189,17 +189,73 @@ def get_collection(palace_path: str):
         return client.create_collection("mempalace_drawers")
 
 
-def file_already_mined(collection, source_file: str) -> bool:
-    """Fast check: has this file been filed before?"""
+def get_file_state(filepath: Path, content: str) -> dict:
+    """Return stable metadata used to detect whether a file changed."""
+    stat = filepath.stat()
+    return {
+        "source_mtime": str(stat.st_mtime_ns),
+        "source_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def get_existing_file_metadata(collection, source_file: str) -> list:
+    """Fetch existing drawer metadata for one source file."""
     try:
-        results = collection.get(where={"source_file": source_file}, limit=1)
-        return len(results.get("ids", [])) > 0
+        results = collection.get(where={"source_file": source_file}, include=["metadatas"])
+        return results.get("metadatas", [])
     except Exception:
-        return False
+        return []
+
+
+def file_needs_reindex(collection, source_file: str, file_state: dict) -> tuple[bool, bool]:
+    """
+    Return (should_index, had_existing_drawers).
+
+    Reindex when:
+      - the file has never been mined
+      - legacy drawers have no fingerprint metadata
+      - the content hash or mtime changed
+    """
+    existing = get_existing_file_metadata(collection, source_file)
+    if not existing:
+        return True, False
+
+    sample = existing[0] or {}
+    existing_hash = sample.get("source_hash")
+    existing_mtime = sample.get("source_mtime")
+
+    if not existing_hash or not existing_mtime:
+        return True, True
+
+    is_changed = (
+        existing_hash != file_state["source_hash"]
+        or existing_mtime != file_state["source_mtime"]
+    )
+    return is_changed, True
+
+
+def delete_drawers_for_file(collection, source_file: str) -> int:
+    """Delete all drawers associated with one source file."""
+    try:
+        results = collection.get(where={"source_file": source_file})
+        ids = results.get("ids", [])
+        if not ids:
+            return 0
+        collection.delete(ids=ids)
+        return len(ids)
+    except Exception:
+        return 0
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    file_state: dict,
 ):
     """Add one drawer to the palace."""
     drawer_id = f"drawer_{wing}_{room}_{hashlib.md5((source_file + str(chunk_index)).encode()).hexdigest()[:16]}"
@@ -215,6 +271,8 @@ def add_drawer(
                     "chunk_index": chunk_index,
                     "added_by": agent,
                     "filed_at": datetime.now().isoformat(),
+                    "source_hash": file_state["source_hash"],
+                    "source_mtime": file_state["source_mtime"],
                 }
             ],
         )
@@ -238,29 +296,41 @@ def process_file(
     rooms: list,
     agent: str,
     dry_run: bool,
-) -> int:
-    """Read, chunk, route, and file one file. Returns drawer count."""
+) -> dict:
+    """Read, chunk, route, and file one file."""
 
-    # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file):
-        return 0
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
     except Exception:
-        return 0
+        return {"status": "unreadable", "drawers": 0, "room": None}
 
     content = content.strip()
+    file_state = get_file_state(filepath, content)
+
+    if not dry_run:
+        should_index, had_existing = file_needs_reindex(collection, source_file, file_state)
+        if not should_index:
+            return {"status": "unchanged", "drawers": 0, "room": None}
+    else:
+        had_existing = False
+
     if len(content) < MIN_CHUNK_SIZE:
-        return 0
+        if not dry_run and had_existing:
+            delete_drawers_for_file(collection, source_file)
+            return {"status": "deleted", "drawers": 0, "room": "general"}
+        return {"status": "too_small", "drawers": 0, "room": None}
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-        return len(chunks)
+        return {"status": "dry_run", "drawers": len(chunks), "room": room}
+
+    if had_existing:
+        delete_drawers_for_file(collection, source_file)
 
     drawers_added = 0
     for chunk in chunks:
@@ -272,11 +342,13 @@ def process_file(
             source_file=source_file,
             chunk_index=chunk["chunk_index"],
             agent=agent,
+            file_state=file_state,
         )
         if added:
             drawers_added += 1
 
-    return drawers_added
+    status = "updated" if had_existing else "new"
+    return {"status": status, "drawers": drawers_added, "room": room}
 
 
 # =============================================================================
@@ -349,11 +421,15 @@ def mine(
         collection = None
 
     total_drawers = 0
-    files_skipped = 0
+    files_unchanged = 0
+    files_updated = 0
+    files_new = 0
+    files_deleted = 0
+    files_unreadable = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
-        drawers = process_file(
+        result = process_file(
             filepath=filepath,
             project_path=project_path,
             collection=collection,
@@ -362,19 +438,43 @@ def mine(
             agent=agent,
             dry_run=dry_run,
         )
-        if drawers == 0 and not dry_run:
-            files_skipped += 1
-        else:
-            total_drawers += drawers
-            room = detect_room(filepath, "", rooms, project_path)
+        status = result["status"]
+        drawers = result["drawers"]
+        room = result["room"]
+
+        if status == "unchanged":
+            files_unchanged += 1
+            continue
+        if status == "unreadable":
+            files_unreadable += 1
+            continue
+        if status == "deleted":
+            files_deleted += 1
+            continue
+
+        total_drawers += drawers
+        if room:
             room_counts[room] += 1
-            if not dry_run:
-                print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+
+        if status == "new":
+            files_new += 1
+        elif status == "updated":
+            files_updated += 1
+
+        if not dry_run:
+            label = "new" if status == "new" else ("updated" if status == "updated" else status)
+            print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers} ({label})")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {len(files) - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
+    print(f"  Files processed: {files_new + files_updated}")
+    print(f"  New files: {files_new}")
+    print(f"  Updated files: {files_updated}")
+    print(f"  Unchanged files: {files_unchanged}")
+    if files_deleted:
+        print(f"  Deleted from palace (now tiny/empty): {files_deleted}")
+    if files_unreadable:
+        print(f"  Unreadable files: {files_unreadable}")
     print(f"  Drawers filed: {total_drawers}")
     print("\n  By room:")
     for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
@@ -390,6 +490,9 @@ def mine(
 
 def status(palace_path: str):
     """Show what's been filed in the palace."""
+    from .config import MempalaceConfig
+    from .notion_integration import NotionWingService
+
     try:
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
@@ -413,5 +516,17 @@ def status(palace_path: str):
         print(f"  WING: {wing}")
         for room, count in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
             print(f"    ROOM: {room:20} {count:5} drawers")
+        print()
+
+    notion_status = NotionWingService(MempalaceConfig()).status(palace_path=palace_path)
+    if notion_status["enabled"]:
+        print("  NOTION")
+        print(f"    Connected:      {notion_status['connected']}")
+        print(f"    Wing:           {notion_status['wing']}")
+        print(f"    Cached pages:   {notion_status['cached_pages']}")
+        print(f"    Cached drawers: {notion_status['cached_drawers']}")
+        print(f"    Comment drawers:{notion_status['cached_comment_drawers']}")
+        if notion_status.get("last_refresh_at"):
+            print(f"    Last refresh:   {notion_status['last_refresh_at']}")
         print()
     print(f"{'=' * 55}\n")

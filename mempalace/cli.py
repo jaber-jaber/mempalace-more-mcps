@@ -101,6 +101,7 @@ def cmd_search(args):
         wing=args.wing,
         room=args.room,
         n_results=args.results,
+        refresh_notion=args.refresh_notion,
     )
 
 
@@ -145,6 +146,77 @@ def cmd_status(args):
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     status(palace_path=palace_path)
+
+
+def cmd_notion(args):
+    from .notion_integration import NotionIntegrationError, NotionWingService
+
+    if not args.notion_command:
+        print("\n  Usage: mempalace notion [connect|status|sync|disconnect]")
+        sys.exit(1)
+
+    service = NotionWingService(MempalaceConfig())
+
+    try:
+        if args.notion_command == "connect":
+            result = service.connect(timeout=args.timeout)
+            print("\n  Notion connected.")
+            if result.get("workspace"):
+                print(f"  Workspace: {result['workspace']}")
+            print(f"  Tools: {', '.join(result.get('tools', []))}")
+            return
+
+        if args.notion_command == "status":
+            palace_path = (
+                os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+            )
+            result = service.status(palace_path=palace_path)
+            print("\n  Notion status")
+            print(f"  Enabled:       {result['enabled']}")
+            print(f"  Connected:     {result['connected']}")
+            print(f"  Wing:          {result['wing']}")
+            print(f"  Live refresh:  {result['live_refresh']}")
+            print(f"  Cached pages:  {result['cached_pages']}")
+            print(f"  Cached drawers:{result['cached_drawers']}")
+            print(f"  Comment drawers:{result['cached_comment_drawers']}")
+            if result.get("workspace"):
+                print(f"  Workspace:     {result['workspace']}")
+            if result.get("last_refresh_at"):
+                print(f"  Last refresh:  {result['last_refresh_at']}")
+            if result.get("last_sync_at"):
+                print(f"  Last sync:     {result['last_sync_at']}")
+            if result.get("last_transport"):
+                print(f"  Transport:     {result['last_transport']}")
+            return
+
+        if args.notion_command == "sync":
+            palace_path = (
+                os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+            )
+            result = service.sync(
+                palace_path=palace_path,
+                query=args.query,
+                limit=args.limit,
+            )
+            print("\n  Notion sync complete.")
+            print(f"  Query:      {result['query']!r}")
+            if result.get("queries_used") and result["queries_used"] != [result["query"]]:
+                print(f"  Seed terms: {', '.join(result['queries_used'])}")
+            print(f"  Considered: {result['considered']}")
+            print(f"  Synced:     {result['synced']}")
+            print(f"  Skipped:    {result['skipped']}")
+            return
+
+        if args.notion_command == "disconnect":
+            result = service.disconnect()
+            print("\n  Notion disconnected.")
+            print(f"  Auth removed:  {result['auth_removed']}")
+            print(f"  Cache removed: {result['cache_removed']}")
+            return
+
+    except NotionIntegrationError as e:
+        print(f"\n  Notion error: {e}")
+        sys.exit(1)
 
 
 def cmd_compress(args):
@@ -310,6 +382,12 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--refresh-notion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refresh the Notion wing during search when Notion is enabled (default: true)",
+    )
 
     # compress
     p_compress = sub.add_parser(
@@ -353,6 +431,36 @@ def main():
     # status
     sub.add_parser("status", help="Show what's been filed")
 
+    # notion
+    p_notion = sub.add_parser("notion", help="Manage the Notion MCP integration")
+    notion_sub = p_notion.add_subparsers(dest="notion_command")
+
+    p_notion_connect = notion_sub.add_parser("connect", help="Connect MemPalace to Notion")
+    p_notion_connect.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="How long to wait for the browser OAuth callback in seconds",
+    )
+
+    notion_sub.add_parser("status", help="Show Notion connection and cache status")
+    p_notion_sync = notion_sub.add_parser(
+        "sync",
+        help="Fetch Notion pages into the local Notion wing if they are missing or stale",
+    )
+    p_notion_sync.add_argument(
+        "--query",
+        default="",
+        help="Broad Notion search query to sync from (default: empty query)",
+    )
+    p_notion_sync.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max Notion search hits to consider for sync (default: 100)",
+    )
+    notion_sub.add_parser("disconnect", help="Remove local Notion credentials and cache state")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -367,6 +475,7 @@ def main():
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
         "status": cmd_status,
+        "notion": cmd_notion,
     }
     dispatch[args.command](args)
 

@@ -24,13 +24,14 @@ import hashlib
 from datetime import datetime
 
 from .config import MempalaceConfig
+from .notion_integration import NotionWingService
 from .searcher import search_memories
 from .palace_graph import traverse, find_tunnels, graph_stats
 import chromadb
 
 from .knowledge_graph import KnowledgeGraph
 
-_kg = KnowledgeGraph()
+_kg = None
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
@@ -57,16 +58,30 @@ def _no_palace():
     }
 
 
+def _get_kg():
+    global _kg
+    if _kg is None:
+        _kg = KnowledgeGraph()
+    return _kg
+
+
 # ==================== READ TOOLS ====================
 
 
 def tool_status():
     col = _get_collection()
-    if not col:
-        return _no_palace()
-    count = col.count()
     wings = {}
     rooms = {}
+    notion_status = NotionWingService(_config).status(palace_path=_config.palace_path)
+
+    if not col:
+        payload = _no_palace()
+        payload["notion"] = notion_status
+        payload["protocol"] = PALACE_PROTOCOL
+        payload["aaak_dialect"] = AAAK_SPEC
+        return payload
+
+    count = col.count()
     try:
         all_meta = col.get(include=["metadatas"])["metadatas"]
         for m in all_meta:
@@ -81,6 +96,7 @@ def tool_status():
         "wings": wings,
         "rooms": rooms,
         "palace_path": _config.palace_path,
+        "notion": notion_status,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
@@ -170,13 +186,20 @@ def tool_get_taxonomy():
     return {"taxonomy": taxonomy}
 
 
-def tool_search(query: str, limit: int = 5, wing: str = None, room: str = None):
+def tool_search(
+    query: str,
+    limit: int = 5,
+    wing: str = None,
+    room: str = None,
+    refresh_notion: bool = True,
+):
     return search_memories(
         query,
         palace_path=_config.palace_path,
         wing=wing,
         room=room,
         n_results=limit,
+        refresh_notion=refresh_notion,
     )
 
 
@@ -308,7 +331,7 @@ def tool_delete_drawer(drawer_id: str):
 
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
-    results = _kg.query_entity(entity, as_of=as_of, direction=direction)
+    results = _get_kg().query_entity(entity, as_of=as_of, direction=direction)
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
@@ -316,7 +339,7 @@ def tool_kg_add(
     subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
 ):
     """Add a relationship to the knowledge graph."""
-    triple_id = _kg.add_triple(
+    triple_id = _get_kg().add_triple(
         subject, predicate, object, valid_from=valid_from, source_closet=source_closet
     )
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
@@ -324,7 +347,7 @@ def tool_kg_add(
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
     """Mark a fact as no longer true (set end date)."""
-    _kg.invalidate(subject, predicate, object, ended=ended)
+    _get_kg().invalidate(subject, predicate, object, ended=ended)
     return {
         "success": True,
         "fact": f"{subject} → {predicate} → {object}",
@@ -334,13 +357,13 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
-    results = _kg.timeline(entity)
+    results = _get_kg().timeline(entity)
     return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
 
 def tool_kg_stats():
     """Knowledge graph overview: entities, triples, relationship types."""
-    return _kg.stats()
+    return _get_kg().stats()
 
 
 # ==================== AGENT DIARY ====================
@@ -593,6 +616,10 @@ TOOLS = {
                 "limit": {"type": "integer", "description": "Max results (default 5)"},
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "refresh_notion": {
+                    "type": "boolean",
+                    "description": "Refresh live Notion pages into the Notion wing before returning merged results (default: true)",
+                },
             },
             "required": ["query"],
         },

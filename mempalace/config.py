@@ -10,6 +10,8 @@ from pathlib import Path
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_NOTION_SERVER_URL = "https://mcp.notion.com"
+DEFAULT_NOTION_WING = "wing_notion"
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -61,6 +63,15 @@ DEFAULT_HALL_KEYWORDS = {
     "creative": ["game", "gameplay", "player", "app", "design", "art", "music", "story"],
 }
 
+DEFAULT_NOTION_CONFIG = {
+    "enabled": False,
+    "wing": DEFAULT_NOTION_WING,
+    "server_url": DEFAULT_NOTION_SERVER_URL,
+    "live_refresh": True,
+    "auth_file": os.path.expanduser("~/.mempalace/notion_auth.json"),
+    "cache_state_file": os.path.expanduser("~/.mempalace/notion_cache_state.json"),
+}
+
 
 class MempalaceConfig:
     """Configuration manager for MemPalace.
@@ -103,6 +114,13 @@ class MempalaceConfig:
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property
+    def notion(self):
+        """Notion MCP integration settings."""
+        notion_cfg = dict(DEFAULT_NOTION_CONFIG)
+        notion_cfg.update(self._file_config.get("notion", {}))
+        return notion_cfg
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():
@@ -132,6 +150,7 @@ class MempalaceConfig:
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
+                "notion": DEFAULT_NOTION_CONFIG,
             }
             with open(self._config_file, "w") as f:
                 json.dump(default_config, f, indent=2)
